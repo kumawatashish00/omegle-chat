@@ -1,103 +1,110 @@
 const express = require("express");
-const http = require("http");
+const http    = require("http");
 const { Server } = require("socket.io");
-const path = require("path");
+const path    = require("path");
 
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server, {
+const io     = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e6,
 });
 
 app.use(express.static(path.join(__dirname, "public")));
 
-// ── State ──────────────────────────────────────────────────────────────
-const waitingQueue = [];   // sockets waiting for a partner
-const pairs        = new Map(); // socketId → partnerSocketId
+// ── ICE servers — STUN (global) + TURN (relay for cross-network) ──────────
+const ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun2.l.google.com:19302" },
+  { urls: "stun:stun3.l.google.com:19302" },
+  { urls: "stun:stun4.l.google.com:19302" },
+  // Free public TURN relay — works across all networks/devices
+  { urls: "turn:openrelay.metered.ca:80",      username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443",     username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:80?transport=tcp",  username: "openrelayproject", credential: "openrelayproject" },
+];
 
-function removeFromQueue(socket) {
-  const idx = waitingQueue.indexOf(socket);
-  if (idx !== -1) waitingQueue.splice(idx, 1);
+// ── State ─────────────────────────────────────────────────────────────────
+const queue = [];           // sockets waiting for a partner
+const pairs = new Map();    // socketId → partnerSocketId
+
+function dequeue(socket) {
+  const i = queue.findIndex(s => s.id === socket.id);
+  if (i !== -1) queue.splice(i, 1);
 }
 
-function getPartner(socketId) {
+function partner(socketId) {
   return pairs.get(socketId);
 }
 
-function disconnectPair(socket) {
-  const partnerId = getPartner(socket.id);
+function unpair(socket) {
+  const pid = partner(socket.id);
   pairs.delete(socket.id);
-  if (partnerId) {
-    pairs.delete(partnerId);
-    const partnerSocket = io.sockets.sockets.get(partnerId);
-    if (partnerSocket) partnerSocket.emit("partner_disconnected");
+  if (pid) {
+    pairs.delete(pid);
+    const ps = io.sockets.sockets.get(pid);
+    if (ps) ps.emit("partner_left");
   }
-  removeFromQueue(socket);
+  dequeue(socket);
+}
+
+function relay(socket, event, data) {
+  const pid = partner(socket.id);
+  if (!pid) return;
+  const ps = io.sockets.sockets.get(pid);
+  if (ps) ps.emit(event, data);
 }
 
 function tryMatch(socket) {
-  if (waitingQueue.length > 0) {
-    const partner = waitingQueue.shift();
-    if (partner.id === socket.id) { waitingQueue.push(socket); return; }
+  // Clean stale sockets from queue
+  while (queue.length && !io.sockets.sockets.has(queue[0].id)) queue.shift();
 
-    pairs.set(socket.id, partner.id);
-    pairs.set(partner.id, socket.id);
-
-    // Tell the FIRST user (partner, who was waiting longer) to create the WebRTC offer
-    partner.emit("matched", { initiator: true });
-    socket.emit("matched",  { initiator: false });
-
-    console.log(`Matched: ${socket.id} <-> ${partner.id}`);
+  // Don't match with self
+  const idx = queue.findIndex(s => s.id !== socket.id);
+  if (idx !== -1) {
+    const peer = queue.splice(idx, 1)[0];
+    pairs.set(socket.id, peer.id);
+    pairs.set(peer.id, socket.id);
+    // peer (was waiting) = initiator
+    peer.emit("matched",   { initiator: true,  iceServers: ICE_SERVERS });
+    socket.emit("matched", { initiator: false, iceServers: ICE_SERVERS });
+    console.log(`✅ Matched ${socket.id.slice(0,5)} ↔ ${peer.id.slice(0,5)}`);
   } else {
-    waitingQueue.push(socket);
+    if (!queue.find(s => s.id === socket.id)) queue.push(socket);
     socket.emit("waiting");
-    console.log(`Waiting: ${socket.id}  queue=${waitingQueue.length}`);
+    console.log(`⌛ Queue: ${queue.length}`);
   }
 }
 
-// ── Relay helper — forward any WebRTC signal to partner ────────────────
-function relay(socket, event, data) {
-  const partnerId = getPartner(socket.id);
-  if (!partnerId) return;
-  const partnerSocket = io.sockets.sockets.get(partnerId);
-  if (partnerSocket) partnerSocket.emit(event, data);
-}
-
-// ── Socket events ──────────────────────────────────────────────────────
-io.on("connection", (socket) => {
-  console.log(`+ ${socket.id}`);
+// ── Socket events ─────────────────────────────────────────────────────────
+io.on("connection", socket => {
+  console.log(`+ ${socket.id.slice(0,5)}`);
   io.emit("online_count", io.engine.clientsCount);
 
   socket.on("find_stranger", () => {
-    if (getPartner(socket.id)) return;
-    removeFromQueue(socket);
+    if (partner(socket.id)) return;
+    dequeue(socket);
     tryMatch(socket);
   });
 
-  // ── WebRTC signaling ───────────────────────────────────────────────
-  socket.on("webrtc_offer",     (data) => relay(socket, "webrtc_offer",     data));
-  socket.on("webrtc_answer",    (data) => relay(socket, "webrtc_answer",    data));
-  socket.on("webrtc_ice",       (data) => relay(socket, "webrtc_ice",       data));
+  // All WebRTC signaling goes through one "signal" event
+  socket.on("signal",       d  => relay(socket, "signal",       d));
 
-  // ── Chat ───────────────────────────────────────────────────────────
-  socket.on("message", (data) => relay(socket, "message", { text: data.text, timestamp: Date.now() }));
-  socket.on("typing",  (val)  => relay(socket, "stranger_typing", val));
+  // Chat
+  socket.on("chat_message", d  => relay(socket, "chat_message", { text: d.text, ts: Date.now() }));
+  socket.on("typing",       val => relay(socket, "typing",      val));
 
-  // ── Control ────────────────────────────────────────────────────────
-  socket.on("skip", () => {
-    disconnectPair(socket);
-    tryMatch(socket);
-  });
-
-  socket.on("stop", () => {
-    disconnectPair(socket);
-    socket.emit("stopped");
-  });
+  socket.on("skip", () => { unpair(socket); tryMatch(socket); });
+  socket.on("stop", () => { unpair(socket); socket.emit("stopped"); });
 
   socket.on("disconnect", () => {
-    disconnectPair(socket);
+    unpair(socket);
     io.emit("online_count", io.engine.clientsCount);
-    console.log(`- ${socket.id}`);
+    console.log(`- ${socket.id.slice(0,5)}`);
   });
 });
 
